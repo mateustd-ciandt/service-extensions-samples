@@ -1,0 +1,4 @@
+<map id="CalloutServer::ReplaceResponseBody" name="CalloutServer::ReplaceResponseBody">
+<area shape="rect" id="node1" title="Replaces the HTTP response body." alt="" coords="213,13,480,39"/>
+<area shape="rect" id="node2" href="$d5/d5c/classCustomCalloutServer.html#a564adedc65678ae1b3ffccb5721d8219" title="Handle HTTP response body (to be overridden)" alt="" coords="5,5,165,47"/>
+</map>

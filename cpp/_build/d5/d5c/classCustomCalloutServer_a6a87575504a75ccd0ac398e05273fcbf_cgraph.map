@@ -1,0 +1,4 @@
+<map id="CustomCalloutServer::OnRequestBody" name="CustomCalloutServer::OnRequestBody">
+<area shape="rect" id="node1" title="Processes incoming request body." alt="" coords="5,5,165,47"/>
+<area shape="rect" id="node2" href="$dd/d00/classCalloutServer.html#a55180d80ceb1dac622dfb7ba3acc3d48" title="Replaces the HTTP request body." alt="" coords="213,13,469,39"/>
+</map>

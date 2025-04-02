@@ -1,0 +1,4 @@
+<map id="CalloutServer::AddResponseHeader" name="CalloutServer::AddResponseHeader">
+<area shape="rect" id="node1" title="Adds a header to the HTTP response." alt="" coords="213,5,420,47"/>
+<area shape="rect" id="node2" href="$d5/d5c/classCustomCalloutServer.html#a53e701f26108655cb719747a016120d4" title="Handle HTTP response headers (to be overridden)" alt="" coords="5,5,165,47"/>
+</map>

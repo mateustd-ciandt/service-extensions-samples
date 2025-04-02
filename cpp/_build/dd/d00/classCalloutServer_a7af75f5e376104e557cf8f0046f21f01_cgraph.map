@@ -1,0 +1,4 @@
+<map id="CalloutServer::CreateSecureServerCredentials" name="CalloutServer::CreateSecureServerCredentials">
+<area shape="rect" id="node1" title="Creates SSL credentials for secure server communication." alt="" coords="5,5,211,47"/>
+<area shape="rect" id="node2" href="$dd/d00/classCalloutServer.html#afe9092f37d17d3ee6eea15c358194458" title="Reads file contents from disk." alt="" coords="259,13,464,39"/>
+</map>

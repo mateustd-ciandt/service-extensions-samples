@@ -1,0 +1,4 @@
+<map id="CustomCalloutServer::OnResponseBody" name="CustomCalloutServer::OnResponseBody">
+<area shape="rect" id="node1" title="Processes outgoing response body." alt="" coords="5,5,165,47"/>
+<area shape="rect" id="node2" href="$dd/d00/classCalloutServer.html#ad652a88cbff2639efe24c3bf2cf47685" title="Replaces the HTTP response body." alt="" coords="213,13,480,39"/>
+</map>

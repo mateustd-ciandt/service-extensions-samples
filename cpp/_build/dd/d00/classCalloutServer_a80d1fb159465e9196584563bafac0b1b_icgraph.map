@@ -1,0 +1,5 @@
+<map id="CalloutServer::OnRequestHeader" name="CalloutServer::OnRequestHeader">
+<area shape="rect" id="node1" title="Handle HTTP request headers (to be overridden)" alt="" coords="491,5,680,47"/>
+<area shape="rect" id="node2" href="$dd/d00/classCalloutServer.html#ad1b03571dfcefe353edde795a673ef60" title="Routes processing requests to appropriate handlers." alt="" coords="221,13,443,39"/>
+<area shape="rect" id="node3" href="$dd/d00/classCalloutServer.html#ab189f17fa87d4935e7763d010fada5c9" title="Main processing loop for handling gRPC streams." alt="" coords="5,13,173,39"/>
+</map>

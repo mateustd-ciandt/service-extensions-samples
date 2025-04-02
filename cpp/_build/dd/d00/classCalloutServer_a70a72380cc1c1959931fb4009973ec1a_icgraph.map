@@ -1,0 +1,4 @@
+<map id="CalloutServer::ReplaceResponseHeader" name="CalloutServer::ReplaceResponseHeader">
+<area shape="rect" id="node1" title="Replaces or adds a header in the HTTP response." alt="" coords="213,5,447,47"/>
+<area shape="rect" id="node2" href="$d5/d5c/classCustomCalloutServer.html#a53e701f26108655cb719747a016120d4" title="Processes outgoing response headers." alt="" coords="5,5,165,47"/>
+</map>
