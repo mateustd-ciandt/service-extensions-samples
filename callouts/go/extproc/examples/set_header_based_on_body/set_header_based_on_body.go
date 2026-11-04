@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -40,8 +41,17 @@ const (
 var errStopStream = errors.New("stop processing stream")
 
 // ExampleCalloutService implements a stateful External Processing service for Envoy.
-// It buffers request and response body chunks and evaluates their contents to compute
-// header mutations, maintaining stream-local context without global locks.
+//
+// It is designed for processing_mode FULL_DUPLEX_STREAMED: it buffers the whole
+// request/response body, computes header mutations from the buffered content,
+// and only then releases (in this order) the header response, the body (echoed
+// back unchanged, chunked to stay below the gRPC message size limit) and the
+// trailers. State is stream-local, so no global locks are needed.
+//
+// In FULL_DUPLEX_STREAMED mode Envoy does NOT forward the body by itself: the
+// server must send every byte back in StreamedBodyResponse messages, otherwise
+// the body is lost. There is no 1:1 relation between received and sent body
+// messages.
 type ExampleCalloutService struct {
 	extproc.UnimplementedExternalProcessorServer
 }
@@ -59,10 +69,11 @@ func (s *ExampleCalloutService) Process(stream extproc.ExternalProcessor_Process
 	for {
 		msg, err := stream.Recv()
 		if err == io.EOF {
-			if err := req.finalize(stream); err != nil {
+			// Safety net: release anything still held when Envoy half-closes.
+			if err := req.flush(stream, false); err != nil {
 				return err
 			}
-			return resp.finalize(stream)
+			return resp.flush(stream, false)
 		}
 		if err != nil {
 			return err
@@ -105,16 +116,19 @@ func (s *ExampleCalloutService) Process(stream extproc.ExternalProcessor_Process
 
 // sideState tracks the processing state for one direction (request or response).
 type sideState struct {
-	isRequest      bool
-	body           bytes.Buffer
-	truncated      bool
-	headersDelayed bool
-	owedAcks       int
+	isRequest bool
 
-	// mutatedBody holds the body content that must be sent back to Envoy
-	// (chunked) instead of an empty ack. It stays nil when the service does
-	// not modify the body.
-	mutatedBody []byte
+	// body holds the buffered body that has not been sent back to Envoy yet.
+	body bytes.Buffer
+
+	// truncated is set when the buffer limit is exceeded on the response side.
+	// From that point on the buffered bytes have been flushed and every
+	// following chunk is passed through untouched.
+	truncated bool
+
+	// headersDelayed is true while the header response is being held until the
+	// body (or trailers) has been seen.
+	headersDelayed bool
 }
 
 // onHeaders holds the header response until body/trailers arrive, unless Envoy
@@ -127,32 +141,43 @@ func (s *sideState) onHeaders(stream extproc.ExternalProcessor_ProcessServer, eo
 	return nil
 }
 
-// onBody buffers the chunk, queues its ack, and finalizes when EOS arrives.
-// In FULL_DUPLEX_STREAMED mode chunks never carry EOS; trailers drive finalize.
+// onBody buffers the chunk and releases everything once the end of the body is
+// known. In FULL_DUPLEX_STREAMED mode, chunks carry no EOS when trailers
+// follow; in that case onTrailers drives the flush.
 func (s *sideState) onBody(stream extproc.ExternalProcessor_ProcessServer, chunk []byte, eos bool) error {
+	// Already past the limit: pass the data through untouched.
+	if s.truncated {
+		return s.sendBodyChunks(stream, chunk, eos)
+	}
+
 	if s.body.Len()+len(chunk) > maxBufferSize {
-		if s.isRequest && !s.truncated {
+		if s.isRequest {
 			if err := sendImmediateResponse(stream, extproctype.StatusCode_PayloadTooLarge, "request_body_buffer_exceeded"); err != nil {
 				return err
 			}
 			return errStopStream
 		}
+		// Response side: never replace the upstream response with an error.
+		// Release headers (flagged as truncated) and the buffered prefix, then
+		// stream the rest through without buffering.
 		s.truncated = true
+		if err := s.flush(stream, false); err != nil {
+			return err
+		}
+		return s.sendBodyChunks(stream, chunk, eos)
 	}
-	if !s.truncated {
-		s.body.Write(chunk)
-	}
-	s.owedAcks++
 
+	s.body.Write(chunk)
 	if eos {
-		return s.finalize(stream)
+		return s.flush(stream, true)
 	}
 	return nil
 }
 
-// onTrailers finalizes pending state, then acknowledges the trailers.
+// onTrailers releases pending state (the body ends here, so its last chunk is
+// sent without end_of_stream), then forwards the trailers.
 func (s *sideState) onTrailers(stream extproc.ExternalProcessor_ProcessServer) error {
-	if err := s.finalize(stream); err != nil {
+	if err := s.flush(stream, false); err != nil {
 		return err
 	}
 
@@ -173,9 +198,11 @@ func (s *sideState) onTrailers(stream extproc.ExternalProcessor_ProcessServer) e
 	return stream.Send(resp)
 }
 
-// finalize flushes a delayed header response followed by all pending body acks,
+// flush releases the delayed header response followed by the buffered body,
 // preserving the Headers -> Body -> Trailers order expected by Envoy.
-func (s *sideState) finalize(stream extproc.ExternalProcessor_ProcessServer) error {
+// bodyEOS is true only when Envoy itself marked the last body chunk as EOS
+// (i.e. no trailers follow).
+func (s *sideState) flush(stream extproc.ExternalProcessor_ProcessServer, bodyEOS bool) error {
 	if s.headersDelayed {
 		if err := s.sendHeadersResponse(stream); err != nil {
 			return err
@@ -183,38 +210,39 @@ func (s *sideState) finalize(stream extproc.ExternalProcessor_ProcessServer) err
 		s.headersDelayed = false
 	}
 
-	// If the body was mutated, send the mutated content in chunks instead of
-	// empty acknowledgements. Each chunk counts as the response for one
-	// outstanding body request; any remaining acks are sent as empty responses.
-	bodyToSend := s.mutatedBody
-	for s.owedAcks > 0 {
-		if len(bodyToSend) > 0 {
-			chunk, eos := nextChunk(bodyToSend)
-			if err := s.sendStreamedBody(stream, chunk, eos); err != nil {
-				return err
-			}
-			bodyToSend = bodyToSend[len(chunk):]
-		} else {
-			if err := s.sendEmptyBodyAck(stream); err != nil {
-				return err
-			}
+	if s.body.Len() == 0 && !bodyEOS {
+		return nil
+	}
+	err := s.sendBodyChunks(stream, s.body.Bytes(), bodyEOS)
+	s.body.Reset()
+	return err
+}
+
+// sendBodyChunks sends data back to Envoy split in chunks of at most
+// maxStreamedChunkSize. Only the last chunk carries eos. An empty body with
+// eos=true is still sent as a single empty chunk so Envoy sees the end of stream.
+func (s *sideState) sendBodyChunks(stream extproc.ExternalProcessor_ProcessServer, data []byte, eos bool) error {
+	if len(data) == 0 {
+		if eos {
+			return s.sendStreamedBody(stream, nil, true)
 		}
-		s.owedAcks--
+		return nil
+	}
+	for len(data) > 0 {
+		n := len(data)
+		if n > maxStreamedChunkSize {
+			n = maxStreamedChunkSize
+		}
+		last := n == len(data)
+		if err := s.sendStreamedBody(stream, data[:n], eos && last); err != nil {
+			return err
+		}
+		data = data[n:]
 	}
 	return nil
 }
 
-// nextChunk returns the next slice of body to send, capped at maxStreamedChunkSize,
-// and reports whether this is the final chunk.
-func nextChunk(body []byte) ([]byte, bool) {
-	n := len(body)
-	if n > maxStreamedChunkSize {
-		n = maxStreamedChunkSize
-	}
-	return body[:n], n == len(body)
-}
-
-// sendStreamedBody emits a streamed body chunk (mutated body path).
+// sendStreamedBody emits a single streamed body chunk.
 func (s *sideState) sendStreamedBody(stream extproc.ExternalProcessor_ProcessServer, chunk []byte, eos bool) error {
 	common := &extproc.CommonResponse{
 		BodyMutation: &extproc.BodyMutation{
@@ -244,26 +272,9 @@ func (s *sideState) sendStreamedBody(stream extproc.ExternalProcessor_ProcessSer
 	return stream.Send(resp)
 }
 
-// sendEmptyBodyAck emits an empty body response (no mutation).
-func (s *sideState) sendEmptyBodyAck(stream extproc.ExternalProcessor_ProcessServer) error {
-	var resp *extproc.ProcessingResponse
-	if s.isRequest {
-		resp = &extproc.ProcessingResponse{
-			Response: &extproc.ProcessingResponse_RequestBody{
-				RequestBody: &extproc.BodyResponse{},
-			},
-		}
-	} else {
-		resp = &extproc.ProcessingResponse{
-			Response: &extproc.ProcessingResponse_ResponseBody{
-				ResponseBody: &extproc.BodyResponse{},
-			},
-		}
-	}
-	return stream.Send(resp)
-}
-
 // sendHeadersResponse computes header mutations based on buffered body and dispatches the response.
+// When the response body exceeded the buffer limit, the analysis only covers
+// the buffered prefix and x-body-truncated is set.
 func (s *sideState) sendHeadersResponse(stream extproc.ExternalProcessor_ProcessServer) error {
 	var mutation *extproc.HeaderMutation
 	if s.body.Len() > 0 || s.truncated {
@@ -313,10 +324,11 @@ func analyzeBodyAndCreateHeaders(bodyContent string) map[string]string {
 	headers := make(map[string]string)
 	headers["x-body-size"] = fmt.Sprintf("%d", len(bodyContent))
 
-	if strings.Contains(strings.ToLower(bodyContent), "error") {
+	lower := strings.ToLower(bodyContent)
+	if strings.Contains(lower, "error") {
 		headers["x-body-has-error"] = "true"
 	}
-	if strings.Contains(strings.ToLower(bodyContent), "warning") {
+	if strings.Contains(lower, "warning") {
 		headers["x-body-has-warning"] = "true"
 	}
 
@@ -335,13 +347,20 @@ func analyzeBodyAndCreateHeaders(bodyContent string) map[string]string {
 
 // convertToEnvoyHeaders transforms standard map pairs into the structured protobuf type
 // using the explicit OVERWRITE_IF_EXISTS_OR_ADD action to prevent duplicates.
+// Keys are sorted so the output is deterministic.
 func convertToEnvoyHeaders(headers map[string]string) []*core.HeaderValueOption {
-	var result []*core.HeaderValueOption
-	for key, value := range headers {
+	keys := make([]string, 0, len(headers))
+	for k := range headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	result := make([]*core.HeaderValueOption, 0, len(keys))
+	for _, key := range keys {
 		result = append(result, &core.HeaderValueOption{
 			Header: &core.HeaderValue{
 				Key:   key,
-				Value: value,
+				Value: headers[key],
 			},
 			AppendAction: core.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
 		})
