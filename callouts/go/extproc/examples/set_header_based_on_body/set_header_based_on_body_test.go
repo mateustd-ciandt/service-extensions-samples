@@ -1,4 +1,4 @@
-// Copyright 2025 Google LLC.
+// Copyright 2026 Google LLC.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,198 +15,148 @@
 package set_header_based_on_body
 
 import (
-	"context"
+	"io"
 	"testing"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	extprocconfig "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	extproc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 )
 
-// TestHandleRequestHeadersSetupBufferedMode tests that the processing mode is correctly set to BUFFERED
-func TestHandleRequestHeadersSetupBufferedMode(t *testing.T) {
-	service := NewExampleCalloutService()
-	defer service.Close()
-	ctx := context.Background()
-
-	headers := &extproc.HttpHeaders{
-		Headers: &core.HeaderMap{
-			Headers: []*core.HeaderValue{
-				{
-					Key:   "host",
-					Value: "example.com",
-				},
-			},
-		},
-	}
-
-	response, err := service.HandleRequestHeaders(ctx, headers)
-
-	if err != nil {
-		t.Errorf("HandleRequestHeaders got err: %v", err)
-	}
-
-	if response == nil {
-		t.Fatalf("HandleRequestHeaders(): got nil resp, want non-nil")
-	}
-
-	// Verify mode override is set correctly
-	if response.ModeOverride == nil {
-		t.Fatalf("Expected ModeOverride to be set, but it was nil")
-	}
-
-	if response.ModeOverride.RequestBodyMode != extprocconfig.ProcessingMode_BUFFERED {
-		t.Errorf("Expected RequestBodyMode to be BUFFERED, got %v", response.ModeOverride.RequestBodyMode)
-	}
-
-	if response.ModeOverride.ResponseBodyMode != extprocconfig.ProcessingMode_BUFFERED {
-		t.Errorf("Expected ResponseBodyMode to be BUFFERED, got %v", response.ModeOverride.ResponseBodyMode)
-	}
+// mockProcessStream simulates Envoy's gRPC stream for testing.
+type mockProcessStream struct {
+	extproc.ExternalProcessor_ProcessServer
+	reqs  []*extproc.ProcessingRequest
+	resps []*extproc.ProcessingResponse
 }
 
-// TestRequestBodyBuffering tests that body content is correctly buffered
-func TestRequestBodyBuffering(t *testing.T) {
-	service := NewExampleCalloutService()
-	defer service.Close()
-	ctx := context.Background()
-
-	// Set up request headers
-	headers := &extproc.HttpHeaders{
-		Headers: &core.HeaderMap{
-			Headers: []*core.HeaderValue{
-				{
-					Key:   "host",
-					Value: "example.com",
-				},
-			},
-		},
+func (m *mockProcessStream) Recv() (*extproc.ProcessingRequest, error) {
+	if len(m.reqs) == 0 {
+		return nil, io.EOF
 	}
-
-	_, err := service.HandleRequestHeaders(ctx, headers)
-	if err != nil {
-		t.Fatalf("HandleRequestHeaders got err: %v", err)
-	}
-
-	// Get the requestID that was created
-	requestID := service.getRequestID(ctx)
-
-	// Send first body chunk (not end of stream)
-	body1 := &extproc.HttpBody{
-		Body:        []byte("This is the first chunk "),
-		EndOfStream: false,
-	}
-
-	_, err = service.HandleRequestBody(ctx, body1)
-	if err != nil {
-		t.Fatalf("HandleRequestBody got err: %v", err)
-	}
-
-	// Verify content was buffered
-	state, exists := service.getState(requestID)
-	if !exists || state.buffer.String() != "This is the first chunk " {
-		t.Errorf("Expected buffer to contain first chunk, got: %s", state.buffer.String())
-	}
-
-	// Send second body chunk (end of stream)
-	body2 := &extproc.HttpBody{
-		Body:        []byte("and this is the second chunk."),
-		EndOfStream: true,
-	}
-
-	_, err = service.HandleRequestBody(ctx, body2)
-	if err != nil {
-		t.Fatalf("HandleRequestBody got err: %v", err)
-	}
-
-	// Verify both chunks were buffered
-	state, exists = service.getState(requestID)
-	if !exists || state.buffer.String() != "This is the first chunk and this is the second chunk." {
-		t.Errorf("Expected buffer to contain both chunks, got: %s", state.buffer.String())
-	}
+	req := m.reqs[0]
+	m.reqs = m.reqs[1:]
+	return req, nil
 }
 
-// TestFullBodyProcessingWithResponseHeaders tests the complete flow where response headers are delayed
-// until the full body is available, and then headers are set based on body content
-func TestFullBodyProcessingWithResponseHeaders(t *testing.T) {
+func (m *mockProcessStream) Send(resp *extproc.ProcessingResponse) error {
+	m.resps = append(m.resps, resp)
+	return nil
+}
+
+func TestHeadersOnlyWithEndOfStream(t *testing.T) {
 	service := NewExampleCalloutService()
-	defer service.Close()
-	ctx := context.Background()
-
-	// Set up request headers
-	reqHeaders := &extproc.HttpHeaders{
-		Headers: &core.HeaderMap{
-			Headers: []*core.HeaderValue{
-				{
-					Key:   "host",
-					Value: "example.com",
+	mockStream := &mockProcessStream{
+		reqs: []*extproc.ProcessingRequest{
+			{
+				Request: &extproc.ProcessingRequest_RequestHeaders{
+					RequestHeaders: &extproc.HttpHeaders{EndOfStream: true},
 				},
 			},
 		},
 	}
 
-	_, err := service.HandleRequestHeaders(ctx, reqHeaders)
-	if err != nil {
-		t.Fatalf("HandleRequestHeaders got err: %v", err)
+	if err := service.Process(mockStream); err != nil {
+		t.Fatalf("Process() returned unexpected error: %v", err)
+	}
+	if len(mockStream.resps) != 1 {
+		t.Fatalf("Expected 1 response, got %d", len(mockStream.resps))
 	}
 
-	// Send body chunks with error content and JSON format
-	body := &extproc.HttpBody{
-		Body:        []byte(`{"status": "error", "message": "Something went wrong"}`),
-		EndOfStream: true,
-	}
-
-	_, err = service.HandleRequestBody(ctx, body)
-	if err != nil {
-		t.Fatalf("HandleRequestBody got err: %v", err)
-	}
-
-	// Set up response headers
-	respHeaders := &extproc.HttpHeaders{
-		Headers: &core.HeaderMap{
-			Headers: []*core.HeaderValue{
-				{
-					Key:   "content-type",
-					Value: "application/json",
-				},
-			},
-		},
-	}
-
-	// Now process response headers which should trigger the full processing
-	resp, err := service.HandleResponseHeaders(ctx, respHeaders)
-	if err != nil {
-		t.Fatalf("HandleResponseHeaders got err: %v", err)
-	}
-
-	// Check that the response has our body-based headers
-	if resp == nil {
-		t.Fatalf("HandleResponseHeaders(): got nil resp, want non-nil")
-	}
-
-	responseHeaders, ok := resp.Response.(*extproc.ProcessingResponse_ResponseHeaders)
+	respHeaders, ok := mockStream.resps[0].Response.(*extproc.ProcessingResponse_RequestHeaders)
 	if !ok {
-		t.Fatalf("Expected ResponseHeaders in response, got different type")
+		t.Fatalf("Expected RequestHeaders response")
+	}
+	if hm := respHeaders.RequestHeaders.Response.HeaderMutation; hm != nil {
+		if n := len(hm.SetHeaders); n > 0 {
+			t.Errorf("Expected no header mutation for empty body, got %d headers", n)
+		}
+	}
+}
+
+func TestHeadersMutatedWhenBodyPresent(t *testing.T) {
+	service := NewExampleCalloutService()
+	mockStream := &mockProcessStream{
+		reqs: []*extproc.ProcessingRequest{
+			{
+				Request: &extproc.ProcessingRequest_RequestHeaders{
+					RequestHeaders: &extproc.HttpHeaders{EndOfStream: false},
+				},
+			},
+			{
+				Request: &extproc.ProcessingRequest_RequestBody{
+					RequestBody: &extproc.HttpBody{
+						Body:        []byte(`{"k":"v"}`),
+						EndOfStream: true,
+					},
+				},
+			},
+		},
 	}
 
-	// Check for required header mutations
-	headerMutation := responseHeaders.ResponseHeaders.Response.HeaderMutation
-	if headerMutation == nil {
-		t.Fatalf("Expected HeaderMutation in response, got nil")
+	if err := service.Process(mockStream); err != nil {
+		t.Fatalf("Process() returned unexpected error: %v", err)
+	}
+	if len(mockStream.resps) < 1 {
+		t.Fatalf("Expected at least 1 response, got %d", len(mockStream.resps))
 	}
 
-	// Create a map of the headers for easier checking
+	respHeaders, ok := mockStream.resps[0].Response.(*extproc.ProcessingResponse_RequestHeaders)
+	if !ok {
+		t.Fatalf("Expected first response to be RequestHeaders")
+	}
+	hm := respHeaders.RequestHeaders.Response.HeaderMutation
+	if hm == nil || len(hm.SetHeaders) == 0 {
+		t.Fatalf("Expected header mutation, got none")
+	}
+	for _, h := range hm.SetHeaders {
+		if h.AppendAction != core.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD {
+			t.Errorf("Expected OVERWRITE_IF_EXISTS_OR_ADD for %s, got %v", h.Header.Key, h.AppendAction)
+		}
+	}
+}
+
+func TestFullDuplexProcessing(t *testing.T) {
+	service := NewExampleCalloutService()
+	mockStream := &mockProcessStream{
+		reqs: []*extproc.ProcessingRequest{
+			{
+				Request: &extproc.ProcessingRequest_RequestHeaders{
+					RequestHeaders: &extproc.HttpHeaders{EndOfStream: false},
+				},
+			},
+			{
+				Request: &extproc.ProcessingRequest_RequestBody{
+					RequestBody: &extproc.HttpBody{Body: []byte(`{"status": `), EndOfStream: false},
+				},
+			},
+			{
+				Request: &extproc.ProcessingRequest_RequestBody{
+					RequestBody: &extproc.HttpBody{Body: []byte(`"error"}`), EndOfStream: true},
+				},
+			},
+		},
+	}
+
+	if err := service.Process(mockStream); err != nil {
+		t.Fatalf("Process() returned unexpected error: %v", err)
+	}
+	if len(mockStream.resps) != 3 {
+		t.Fatalf("Expected 3 responses (1 Headers, 2 Body chunks), got %d", len(mockStream.resps))
+	}
+
+	respHeaders, ok := mockStream.resps[0].Response.(*extproc.ProcessingResponse_RequestHeaders)
+	if !ok {
+		t.Fatalf("Expected first response to be RequestHeaders")
+	}
 	headerMap := make(map[string]string)
-	for _, header := range headerMutation.SetHeaders {
+	for _, header := range respHeaders.RequestHeaders.Response.HeaderMutation.SetHeaders {
 		headerMap[header.Header.Key] = header.Header.Value
 	}
-
-	// Check for specific headers we expect based on the JSON error content
 	expectedHeaders := map[string]string{
-		"x-body-size":      "54", // Updated to match actual size
+		"x-body-size":      "19",
 		"x-body-has-error": "true",
 		"x-body-format":    "json",
 	}
-
 	for k, v := range expectedHeaders {
 		if headerMap[k] != v {
 			t.Errorf("Expected header %s=%s, got %s", k, v, headerMap[k])
@@ -214,163 +164,98 @@ func TestFullBodyProcessingWithResponseHeaders(t *testing.T) {
 	}
 }
 
-// TestFullDuplexWithTrailers tests the case where trailers are present
-func TestFullDuplexWithTrailers(t *testing.T) {
+// TestFullDuplexStreamedWithTrailers simulates FULL_DUPLEX_STREAMED: body chunks
+// never carry EOS; the end of the body is signaled by trailers.
+func TestFullDuplexStreamedWithTrailers(t *testing.T) {
 	service := NewExampleCalloutService()
-	defer service.Close()
-	ctx := context.Background()
-
-	// Set up request headers
-	reqHeaders := &extproc.HttpHeaders{
-		Headers: &core.HeaderMap{
-			Headers: []*core.HeaderValue{
-				{
-					Key:   "host",
-					Value: "example.com",
+	mockStream := &mockProcessStream{
+		reqs: []*extproc.ProcessingRequest{
+			{
+				Request: &extproc.ProcessingRequest_RequestHeaders{
+					RequestHeaders: &extproc.HttpHeaders{EndOfStream: false},
+				},
+			},
+			{
+				Request: &extproc.ProcessingRequest_RequestBody{
+					RequestBody: &extproc.HttpBody{
+						Body:        []byte(`<warning>xml</warning>`),
+						EndOfStream: false,
+					},
+				},
+			},
+			{
+				Request: &extproc.ProcessingRequest_RequestTrailers{
+					RequestTrailers: &extproc.HttpTrailers{},
 				},
 			},
 		},
 	}
 
-	_, err := service.HandleRequestHeaders(ctx, reqHeaders)
-	if err != nil {
-		t.Fatalf("HandleRequestHeaders got err: %v", err)
+	if err := service.Process(mockStream); err != nil {
+		t.Fatalf("Process() returned unexpected error: %v", err)
 	}
-
-	// Send body chunks without end_of_stream
-	body := &extproc.HttpBody{
-		Body:        []byte(`<warning>This is an XML document with a warning</warning>`),
-		EndOfStream: false, // Not end of stream because trailers follow
+	if len(mockStream.resps) != 3 {
+		t.Fatalf("Expected 3 responses (Headers, Body, Trailers), got %d", len(mockStream.resps))
 	}
-
-	_, err = service.HandleRequestBody(ctx, body)
-	if err != nil {
-		t.Fatalf("HandleRequestBody got err: %v", err)
+	if _, ok := mockStream.resps[0].Response.(*extproc.ProcessingResponse_RequestHeaders); !ok {
+		t.Errorf("First response should be RequestHeaders")
 	}
-
-	// Set up response headers (but these won't trigger processing yet)
-	respHeaders := &extproc.HttpHeaders{
-		Headers: &core.HeaderMap{
-			Headers: []*core.HeaderValue{
-				{
-					Key:   "content-type",
-					Value: "application/xml",
-				},
-			},
-		},
+	if _, ok := mockStream.resps[1].Response.(*extproc.ProcessingResponse_RequestBody); !ok {
+		t.Errorf("Second response should be RequestBody")
 	}
-
-	// Process response headers
-	_, err = service.HandleResponseHeaders(ctx, respHeaders)
-	if err != nil {
-		t.Fatalf("HandleResponseHeaders got err: %v", err)
-	}
-
-	// Now send trailers which should trigger processing
-	trailers := &extproc.HttpTrailers{
-		Trailers: &core.HeaderMap{
-			Headers: []*core.HeaderValue{
-				{
-					Key:   "x-checksum",
-					Value: "abc123",
-				},
-			},
-		},
-	}
-
-	finalResp, err := service.HandleRequestTrailers(ctx, trailers)
-	if err != nil {
-		t.Fatalf("HandleRequestTrailers got err: %v", err)
-	}
-
-	// Check that the response has our body-based headers
-	if finalResp == nil {
-		t.Fatalf("HandleRequestTrailers(): got nil resp, want non-nil")
-	}
-
-	responseHeaders, ok := finalResp.Response.(*extproc.ProcessingResponse_ResponseHeaders)
-	if !ok {
-		t.Fatalf("Expected ResponseHeaders in response, got different type")
-	}
-
-	// Check for required header mutations
-	headerMutation := responseHeaders.ResponseHeaders.Response.HeaderMutation
-	if headerMutation == nil {
-		t.Fatalf("Expected HeaderMutation in response, got nil")
-	}
-
-	// Create a map of the headers for easier checking
-	headerMap := make(map[string]string)
-	for _, header := range headerMutation.SetHeaders {
-		headerMap[header.Header.Key] = header.Header.Value
-	}
-
-	// Check for specific headers we expect based on the XML warning content
-	expectedHeaders := map[string]string{
-		"x-body-size":        "57", // Updated to match actual size
-		"x-body-has-warning": "true",
-		"x-body-format":      "xml",
-	}
-
-	for k, v := range expectedHeaders {
-		if headerMap[k] != v {
-			t.Errorf("Expected header %s=%s, got %s", k, v, headerMap[k])
-		}
+	if _, ok := mockStream.resps[2].Response.(*extproc.ProcessingResponse_RequestTrailers); !ok {
+		t.Errorf("Third response should be RequestTrailers")
 	}
 }
 
-// TestAnalyzeBodyAndCreateHeaders validates the header creation logic
-func TestAnalyzeBodyAndCreateHeaders(t *testing.T) {
-	testCases := []struct {
-		name        string
-		bodyContent string
-		expected    map[string]string
-	}{
-		{
-			name:        "JSON with error",
-			bodyContent: `{"status": "error", "message": "Something went wrong"}`,
-			expected: map[string]string{
-				"x-body-size":      "54", // Updated to match actual size
-				"x-body-has-error": "true",
-				"x-body-format":    "json",
+// TestResponseTruncationFlag ensures that exceeding maxBufferSize on the response
+// side does NOT replace the upstream response with an ImmediateResponse; instead
+// the truncation is flagged via header.
+func TestResponseTruncationFlag(t *testing.T) {
+	service := NewExampleCalloutService()
+	largeChunk := make([]byte, maxBufferSize+1)
+	for i := range largeChunk {
+		largeChunk[i] = 'a'
+	}
+
+	mockStream := &mockProcessStream{
+		reqs: []*extproc.ProcessingRequest{
+			{
+				Request: &extproc.ProcessingRequest_ResponseHeaders{
+					ResponseHeaders: &extproc.HttpHeaders{EndOfStream: false},
+				},
 			},
-		},
-		{
-			name:        "XML with warning",
-			bodyContent: `<warning>This is a warning message</warning>`,
-			expected: map[string]string{
-				"x-body-size":        "44", // Updated to match actual size
-				"x-body-has-warning": "true",
-				"x-body-format":      "xml",
-			},
-		},
-		{
-			name:        "Plain text",
-			bodyContent: "This is just plain text",
-			expected: map[string]string{
-				"x-body-size":   "23", // Updated to match actual size
-				"x-body-format": "text",
+			{
+				Request: &extproc.ProcessingRequest_ResponseBody{
+					ResponseBody: &extproc.HttpBody{Body: largeChunk, EndOfStream: true},
+				},
 			},
 		},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			headers := analyzeBodyAndCreateHeaders(tc.bodyContent)
+	if err := service.Process(mockStream); err != nil {
+		t.Fatalf("Process() returned unexpected error: %v", err)
+	}
+	if len(mockStream.resps) < 1 {
+		t.Fatalf("Expected at least 1 response, got %d", len(mockStream.resps))
+	}
 
-			// Check all expected headers exist with correct values
-			for k, v := range tc.expected {
-				if headers[k] != v {
-					t.Errorf("Expected header %s=%s, got %s", k, v, headers[k])
-				}
-			}
-
-			// Check no unexpected headers
-			for k := range headers {
-				if _, exists := tc.expected[k]; !exists {
-					t.Errorf("Unexpected header found: %s=%s", k, headers[k])
-				}
-			}
-		})
+	respHeaders, ok := mockStream.resps[0].Response.(*extproc.ProcessingResponse_ResponseHeaders)
+	if !ok {
+		t.Fatalf("Expected first response to be ResponseHeaders")
+	}
+	hm := respHeaders.ResponseHeaders.Response.HeaderMutation
+	if hm == nil {
+		t.Fatalf("Expected header mutation, got none")
+	}
+	found := false
+	for _, h := range hm.SetHeaders {
+		if h.Header.Key == "x-body-truncated" && h.Header.Value == "true" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Expected x-body-truncated: true header, not found")
 	}
 }
