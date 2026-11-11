@@ -47,7 +47,7 @@ rust_library(
     version = "0.14.7",
     deps = [
         "@cu__generic-array-0.14.7//:build_script_build",
-        "@cu__typenum-1.19.0//:typenum",
+        "@cu__typenum-1.17.0//:typenum",
     ],
 )
 

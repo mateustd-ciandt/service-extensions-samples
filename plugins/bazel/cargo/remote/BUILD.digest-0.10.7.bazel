@@ -52,7 +52,7 @@ rust_library(
     version = "0.10.7",
     deps = [
         "@cu__block-buffer-0.10.4//:block_buffer",
-        "@cu__crypto-common-0.1.7//:crypto_common",
+        "@cu__crypto-common-0.1.6//:crypto_common",
         "@cu__subtle-2.6.1//:subtle",
     ],
 )
